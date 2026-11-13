@@ -382,6 +382,17 @@ Why the host is a child process: macOS privacy checks (TCC) cover files on remov
 
 Signing: `pack_app.py` signs the inner host first, then the bundle (`codesign --force --sign <identity>`). It signs ad-hoc by default; `--mac-sign "<identity>"` (`MAC_SIGN` in Spyder) names a Developer ID or another identity. It never uses the hardened runtime: `--options runtime` refuses the executable memory the host maps for the game's code. Notarization needs the hardened runtime, so the app is not notarized. Gatekeeper blocks it on a Mac it was downloaded to until it is allowed in System Settings › Privacy & Security. `dm/tools/tests/test_nsp_mac_app.py` tests the packer and the launcher with a stand-in host, without game files.
 
+### Updating the host of an app already packed
+
+A host change (a fix in `dm/host`, such as [generic HID gamepads](reference/services.md#generic-hid-gamepads-gamecontroller-does-not-take)) reaches an app only when the app is packed again: `--platform mac-app` on the game's NSP folder rebuilds the host and repacks, and an app packed after the change has it. Without the NSP folder at hand, the host alone can be swapped in place, built from the profile the app was packed with:
+
+1. Find the title ID: `defaults read "/Applications/<game name>.app/Contents/Info.plist" CFBundleIdentifier` (`org.nxnative.<title ID>`, lowercase; the profile folder is uppercase).
+2. Find the profile. When `<NSP folder>/<id>_build/profile/<id>/` exists, the app was packed from a profile derived for its version: build with `DM_GAMES_DIR="<NSP folder>/<id>_build/profile" DM_GAMES_FIRST=1 make -C dm/host GAME=<id> dmhost`. Otherwise `make -C dm/host GAME=<id> dmhost`, after checking that the app's build ID (the first 32 hex digits of `Contents/Resources/dm/main.fixups.tsv`) is a `build` row of `dm/games/<id>/game.tsv`.
+3. Quit the game, keep the old host (`cp -p ".../Contents/MacOS/dmhost" <backup>`), copy `dm/host/dmhost` over it, then sign as `pack_app.py` does, inner host first: `codesign --force --sign - ".../Contents/MacOS/dmhost"`, then `codesign --force --sign - "<game name>.app"`.
+4. Open the game and check its log (`~/Library/Logs/nxnative/<id>.log`) for the change, such as `HID gamepad '…' connected`.
+
+`make` writes `dm/host/dmhost` for one game at a time: copy it into the app before building the next game's host.
+
 ## Build and run on a device with Xcode
 
 With an Apple developer account, Xcode can sign and install the app itself:

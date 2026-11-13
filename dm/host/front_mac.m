@@ -18,6 +18,7 @@
 #include "motion_apple.h"
 #include "motion_pro_mac.h"
 #include "pad_apple.h"
+#include "pad_hid.h"
 #include <signal.h>
 #include <math.h>
 
@@ -179,6 +180,73 @@ static void pads_changed(GCController *gone) {
     dm_pad_players(pad_slot_mask(&g_slots));
     pro_players_changed(gone);
 }
+// Generic HID gamepads (pad_hid.h): a pad GameController gives no controller for is read from its HID device, and holds a slot as a GameController pad does (the IOHIDDevice is
+// its owner). A device whose product name a GameController controller also has is left to GameController; GameController can publish its controller a moment after the
+// HID match, so a new device is looked at a second later. No rumble or motion on these pads
+typedef struct hid_pad { IOHIDDeviceRef dev; pad_hid st; char name[64]; struct hid_pad *next; } hid_pad;
+static hid_pad *g_hid_pads;
+static IOHIDManagerRef g_hid_manager;
+static uint8_t g_hid_map[PAD_HID_MAPPED];
+static int g_hid_log;   // DM_PAD_HID_LOG=1: log each HID button number pressed, to write a DM_PAD_HID_MAP
+static void hid_pad_push(hid_pad *h) {
+    if (!g_input_on) return;
+    int p = g_merge ? 0 : pad_slot_of(&g_slots, h->dev); if (p < 0) return;
+    dm_pad_set_player(p, pad_hid_buttons(&h->st, g_hid_map), h->st.axis[0], h->st.axis[1], h->st.axis[2], h->st.axis[3]);
+}
+static void hid_pad_value(void *ctx, IOReturn result, void *sender, IOHIDValueRef v) {
+    (void)sender; if (result != kIOReturnSuccess) return;
+    hid_pad *h = ctx; IOHIDElementRef e = IOHIDValueGetElement(v);
+    if (g_hid_log && IOHIDElementGetUsagePage(e) == kHIDPage_Button && IOHIDValueGetIntegerValue(v)) LOG("HID gamepad '%s': button %u", h->name, IOHIDElementGetUsage(e));
+    pad_hid_value(&h->st, IOHIDElementGetUsagePage(e), IOHIDElementGetUsage(e), (long)IOHIDValueGetIntegerValue(v), (long)IOHIDElementGetLogicalMin(e), (long)IOHIDElementGetLogicalMax(e));
+    hid_pad_push(h);
+}
+static void hid_pad_add(IOHIDDeviceRef dev, NSString *name) {
+    NSSet *now = CFBridgingRelease(IOHIDManagerCopyDevices(g_hid_manager));
+    if (![now containsObject:(__bridge id)dev]) return;   // gone within the second
+    for (hid_pad *h = g_hid_pads; h; h = h->next) if (h->dev == dev) return;
+    for (GCController *c in GCController.controllers) if ([c.vendorName isEqualToString:name]) { LOG("HID gamepad '%s': GameController has it", name.UTF8String); return; }
+    int p = g_merge ? 0 : pad_slot_take(&g_slots, dev, name.UTF8String);
+    if (p < 0) { LOG("HID gamepad '%s' connected: all %d players are taken, not used", name.UTF8String, DM_PLAYERS); return; }
+    hid_pad *h = calloc(1, sizeof *h); if (!h) { LOG("[RED] HID gamepad: cannot allocate its state"); if (!g_merge) pad_slot_free(&g_slots, dev); return; }
+    h->dev = (IOHIDDeviceRef)CFRetain(dev); h->st.hat = -1; snprintf(h->name, sizeof h->name, "%s", name.UTF8String); h->next = g_hid_pads; g_hid_pads = h;
+    IOHIDDeviceRegisterInputValueCallback(dev, hid_pad_value, h);
+    char nb[16]; npad_name(p, nb, sizeof nb); LOG("HID gamepad '%s' connected (no GameController profile, read by HID usage): player %d (npad %s)", h->name, p + 1, nb);
+    dm_pad_players(pad_slot_mask(&g_slots));
+}
+static void hid_pad_found(void *ctx, IOReturn result, void *sender, IOHIDDeviceRef dev) {
+    (void)ctx; (void)sender;
+    if (result != kIOReturnSuccess || IOHIDDeviceGetProperty(dev, CFSTR(kIOHIDGCSyntheticDeviceKey)) == kCFBooleanTrue) return;
+    NSString *name = (__bridge NSString *)IOHIDDeviceGetProperty(dev, CFSTR(kIOHIDProductKey)) ?: @"?";
+    CFRetain(dev);
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC), dispatch_get_main_queue(), ^{ hid_pad_add(dev, name); CFRelease(dev); });
+}
+static void hid_pad_removed(void *ctx, IOReturn result, void *sender, IOHIDDeviceRef dev) {
+    (void)ctx; (void)result; (void)sender;
+    hid_pad **link = &g_hid_pads;
+    while (*link && (*link)->dev != dev) link = &(*link)->next;
+    if (!*link) return;
+    hid_pad *h = *link; *link = h->next;
+    IOHIDDeviceRegisterInputValueCallback(dev, NULL, NULL);
+    int p = g_merge ? 0 : pad_slot_free(&g_slots, dev);
+    if (p >= 0) { dm_pad_set_player(p, 0, 0, 0, 0, 0); LOG("HID gamepad '%s' disconnected: player %d is free", h->name, p + 1); }   // nothing stays pressed
+    dm_pad_players(pad_slot_mask(&g_slots));
+    CFRelease(h->dev); free(h);
+}
+static void hid_pads_start(void) {
+    for (int i = 0; i < PAD_HID_MAPPED; i++) g_hid_map[i] = pad_hid_default_map[i];
+    const char *l = getenv("DM_PAD_HID_LOG"); g_hid_log = l && atoi(l);
+    const char *e = getenv("DM_PAD_HID_MAP");
+    if (e && !pad_hid_parse_map(g_hid_map, e)) LOG("[RED] DM_PAD_HID_MAP '%s': not twelve HID button numbers 1..32; using the default", e);
+    g_hid_manager = IOHIDManagerCreate(kCFAllocatorDefault, kIOHIDOptionsTypeNone); if (!g_hid_manager) return;
+    IOHIDManagerSetDeviceMatchingMultiple(g_hid_manager, (__bridge CFArrayRef)@[
+        @{@kIOHIDDeviceUsagePageKey: @(kHIDPage_GenericDesktop), @kIOHIDDeviceUsageKey: @(kHIDUsage_GD_GamePad)},
+        @{@kIOHIDDeviceUsagePageKey: @(kHIDPage_GenericDesktop), @kIOHIDDeviceUsageKey: @(kHIDUsage_GD_Joystick)}]);
+    IOHIDManagerRegisterDeviceMatchingCallback(g_hid_manager, hid_pad_found, NULL);
+    IOHIDManagerRegisterDeviceRemovalCallback(g_hid_manager, hid_pad_removed, NULL);
+    IOHIDManagerScheduleWithRunLoop(g_hid_manager, CFRunLoopGetMain(), kCFRunLoopCommonModes);
+    IOReturn r = IOHIDManagerOpen(g_hid_manager, kIOHIDOptionsTypeNone);   // nonexclusive: GameController keeps the pads it knows
+    if (r != kIOReturnSuccess) LOG("[RED] HID gamepads: cannot open HID (0x%x); only GameController pads are read", r);
+}
 // Focus: a window that is no longer key sees no key-up, mouse-up or controller release, so whatever is held when it loses focus (another app, the text box, minimized) would
 // stay pressed in the game. The front end releases only what it pressed itself: scripted buttons and sticks have their own path, and the touch is also DM_KEYS / DM_CTL's (hle_hid.c).
 // Out of focus a controller's changes are ignored, so back in focus each controller is read as it is now (a button still held, a stick still deflected)
@@ -190,12 +258,14 @@ static void input_release(void) {
     if (g_mouse_down) { g_mouse_down = 0; dm_touch_set(NULL, 0); }
     if (g_merge) { for (GCController *c in GCController.controllers) if (c.extendedGamepad) { dm_pad_set(0, 0, 0, 0, 0); break; } }
     else for (int p = 0; p < DM_PLAYERS; p++) if (g_held[p]) dm_pad_set_player(p, 0, 0, 0, 0, 0);
+    for (hid_pad *h = g_hid_pads; h; h = h->next) { int p = g_merge ? 0 : pad_slot_of(&g_slots, h->dev); if (p >= 0) dm_pad_set_player(p, 0, 0, 0, 0, 0); }
 }
 static void input_resume(void) {
     g_input_on = 1;
     dm_motion_pro_active(1);
     if (g_merge) { for (GCController *c in GCController.controllers) if (c.extendedGamepad) pad_read(c.extendedGamepad); }
     else for (int p = 0; p < DM_PLAYERS; p++) if (g_held[p].extendedGamepad) pad_read(g_held[p].extendedGamepad);
+    for (hid_pad *h = g_hid_pads; h; h = h->next) hid_pad_push(h);
 }
 static void pads_start(void) {
     const char *e = getenv("DM_PAD_MERGE"); g_merge = e && atoi(e);
@@ -205,6 +275,7 @@ static void pads_start(void) {
     LOG("front end: %s", g_merge ? "every controller is player 1 (DM_PAD_MERGE)" : g_kbd_own ? "the keyboard is player 1, each controller a player of its own from player 2 on (DM_KBD_PLAYER=own)"
                                                                            : "each controller is a player of its own, the keyboard plays with player 1");
     pads_changed(nil);
+    hid_pads_start();
     dm_motion_pro_start(pro_devices_changed);
 }
 
